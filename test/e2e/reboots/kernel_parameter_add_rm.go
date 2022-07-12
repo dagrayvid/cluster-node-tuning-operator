@@ -37,8 +37,8 @@ var _ = ginkgo.Describe("[reboots][kernel_parameter_add_rm] Node Tuning Operator
 			if node != nil {
 				util.ExecAndLogCommand("oc", "label", "node", "--overwrite", node.Name, nodeLabelRealtime+"-")
 			}
-			util.ExecAndLogCommand("oc", "delete", "-n", ntoconfig.OperatorNamespace(), "-f", profileParent)
-			util.ExecAndLogCommand("oc", "delete", "-n", ntoconfig.OperatorNamespace(), "-f", profileChild)
+			util.ExecAndLogCommand("oc", "delete", "-n", ntoconfig.WatchNamespace(), "-f", profileParent)
+			util.ExecAndLogCommand("oc", "delete", "-n", ntoconfig.WatchNamespace(), "-f", profileChild)
 			util.ExecAndLogCommand("oc", "delete", "-f", mcpRealtime)
 		})
 
@@ -76,7 +76,7 @@ var _ = ginkgo.Describe("[reboots][kernel_parameter_add_rm] Node Tuning Operator
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 			ginkgo.By(fmt.Sprintf("creating custom parent profile %s", profileParent))
-			_, _, err = util.ExecAndLogCommand("oc", "create", "-n", ntoconfig.OperatorNamespace(), "-f", profileParent)
+			_, _, err = util.ExecAndLogCommand("oc", "create", "-n", ntoconfig.WatchNamespace(), "-f", profileParent)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 			ginkgo.By(fmt.Sprintf("creating custom MachineConfigPool %s", mcpRealtime))
@@ -99,7 +99,7 @@ var _ = ginkgo.Describe("[reboots][kernel_parameter_add_rm] Node Tuning Operator
 			}
 
 			ginkgo.By(fmt.Sprintf("creating custom child profile %s", profileChild))
-			_, _, err = util.ExecAndLogCommand("oc", "create", "-n", ntoconfig.OperatorNamespace(), "-f", profileChild)
+			_, _, err = util.ExecAndLogCommand("oc", "create", "-n", ntoconfig.WatchNamespace(), "-f", profileChild)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 			// By creating the custom child profile, we will first see worker-rt MachineConfigPool UpdatedMachineCount drop to 0 first...
@@ -129,11 +129,11 @@ var _ = ginkgo.Describe("[reboots][kernel_parameter_add_rm] Node Tuning Operator
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 			ginkgo.By(fmt.Sprintf("deleting the custom parent profile %s", profileParent))
-			_, _, err = util.ExecAndLogCommand("oc", "delete", "-n", ntoconfig.OperatorNamespace(), "-f", profileParent)
+			_, _, err = util.ExecAndLogCommand("oc", "delete", "-n", ntoconfig.WatchNamespace(), "-f", profileParent)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 			ginkgo.By(fmt.Sprintf("deleting the custom child profile %s", profileChild))
-			_, _, err = util.ExecAndLogCommand("oc", "delete", "-n", ntoconfig.OperatorNamespace(), "-f", profileChild)
+			_, _, err = util.ExecAndLogCommand("oc", "delete", "-n", ntoconfig.WatchNamespace(), "-f", profileChild)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 			// Wait for the worker machineCount to go to the original value when the node was not part of worker-rt pool.
