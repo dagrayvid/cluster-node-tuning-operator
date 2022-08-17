@@ -42,6 +42,7 @@ import (
 	"github.com/openshift/cluster-node-tuning-operator/version"
 
 	ign3types "github.com/coreos/ignition/v2/config/v3_2/types"
+	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 	mcfgclientset "github.com/openshift/machine-config-operator/pkg/generated/clientset/versioned"
 	mcfginformers "github.com/openshift/machine-config-operator/pkg/generated/informers/externalversions"
 )
@@ -51,17 +52,18 @@ const (
 	// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.3s, 2.6s, 5.1s, 10.2s, 20.4s, 41s, 82s
 	maxRetries = 15
 	// workqueue related constants
-	wqKindPod                = "pod"
-	wqKindNode               = "node"
-	wqKindClusterOperator    = "clusteroperator"
-	wqKindDaemonSet          = "daemonset"
-	wqKindTuned              = "tuned"
-	wqKindProfile            = "profile"
-	wqKindConfigMap          = "configmap"
-	wqKindMachineConfigPool  = "machineconfigpool"
+	wqKindPod               = "pod"
+	wqKindNode              = "node"
+	wqKindClusterOperator   = "clusteroperator"
+	wqKindDaemonSet         = "daemonset"
+	wqKindTuned             = "tuned"
+	wqKindProfile           = "profile"
+	wqKindConfigMap         = "configmap"
+	wqKindMachineConfigPool = "machineconfigpool"
 
-	tunedConfigMapAnnotation = "hypershift.openshift.io/tuned-config"
-	tunedConfigMapConfigKey  = "tuned"
+	tunedConfigMapAnnotation  = "hypershift.openshift.io/tuned-config"
+	tunedConfigMapConfigKey   = "tuned"
+	HyperShiftConfigMapPrefix = "nto-mc-"
 )
 
 // Controller is the controller implementation for Tuned resources
@@ -395,7 +397,11 @@ func (c *Controller) sync(key wqKey) error {
 		if err != nil {
 			return err
 		}
-
+	} else {
+		err = c.pruneMachineConfigsHyperShift()
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -565,6 +571,14 @@ func (c *Controller) syncDaemonSet(tuned *tunedv1.Tuned) error {
 }
 
 func (c *Controller) syncProfile(tuned *tunedv1.Tuned, nodeName string) error {
+	var (
+		tunedProfileName string
+		mcLabels         map[string]string
+		pools            []*mcfgv1.MachineConfigPool
+		operand          tunedv1.OperandConfig
+		nodePoolName     string
+	)
+
 	profileMf := ntomf.TunedProfile()
 	profileMf.ObjectMeta.OwnerReferences = getDefaultTunedRefs(tuned)
 
@@ -584,17 +598,19 @@ func (c *Controller) syncProfile(tuned *tunedv1.Tuned, nodeName string) error {
 		return nil
 	}
 
-	// Check if node labels are already cached.  If not, do not sync.
-	// Profile update/sync is triggered later on once node labels are cached on
-	// the node event.
-	if c.pc.state.nodeLabels[nodeName] == nil {
-		return nil
+	// TODO consider having separate calculateProfileHyperShift func...
+	if !ntoconfig.InHyperShift() {
+		tunedProfileName, mcLabels, pools, operand, err = c.pc.calculateProfile(nodeName)
+		if err != nil {
+			return err
+		}
+	} else {
+		tunedProfileName, nodePoolName, operand, err = c.pc.calculateProfileHyperShift(nodeName)
+		if err != nil {
+			return err
+		}
 	}
 
-	tunedProfileName, mcLabels, pools, operand, err := c.pc.calculateProfile(nodeName)
-	if err != nil {
-		return err
-	}
 	metrics.ProfileCalculated(profileMf.Name, tunedProfileName)
 
 	profile, err := c.listers.TunedProfiles.Get(profileMf.Name)
@@ -638,8 +654,8 @@ func (c *Controller) syncProfile(tuned *tunedv1.Tuned, nodeName string) error {
 		return fmt.Errorf("failed to get ProviderName: %v", err)
 	}
 
-	if mcLabels != nil {
-		if !ntoconfig.InHyperShift() {
+	if !ntoconfig.InHyperShift() {
+		if mcLabels != nil {
 			// The Tuned daemon profile 'tunedProfileName' for nodeName matched with MachineConfig
 			// labels set for additional machine configuration.  Sync the operator-created
 			// MachineConfig for MachineConfigPools 'pools'.
@@ -651,9 +667,18 @@ func (c *Controller) syncProfile(tuned *tunedv1.Tuned, nodeName string) error {
 					return fmt.Errorf("failed to update Profile %s: %v", profile.Name, err)
 				}
 			}
-		} else {
-			klog.Infof("Ignoring MachineConfig label matching for Profile %s. MachineConfig API not currently supported in Hypershift.", tunedProfileName)
 		}
+	} else {
+		// In HyperShift
+		if profile.Status.TunedProfile == tunedProfileName && profileApplied(profile) {
+			// Synchronize MachineConfig only once the (calculated) TuneD profile 'tunedProfileName'
+			// has been successfully applied.
+			err := c.syncMachineConfigHyperShift(nodePoolName, mcLabels, profile)
+			if err != nil {
+				return fmt.Errorf("failed to update Profile %s: %v", profile.Name, err)
+			}
+		}
+
 	}
 
 	if profile.Spec.Config.TunedProfile == tunedProfileName &&
@@ -746,7 +771,7 @@ func (c *Controller) syncMachineConfig(name string, labels map[string]string, pr
 			if err != nil {
 				return fmt.Errorf("failed to create MachineConfig %s: %v", mc.ObjectMeta.Name, err)
 			}
-			klog.Infof("created MachineConfig %s with%s", mc.ObjectMeta.Name, logline(haveIgnition, len(bootcmdline) != 0, bootcmdline))
+			klog.Infof("created MachineConfig %s with %s", mc.ObjectMeta.Name, logline(haveIgnition, len(bootcmdline) != 0, bootcmdline))
 			return nil
 		}
 		return err
@@ -777,6 +802,129 @@ func (c *Controller) syncMachineConfig(name string, labels map[string]string, pr
 	}
 
 	klog.Infof("updated MachineConfig %s with%s", mc.ObjectMeta.Name, l)
+
+	return nil
+}
+
+func (c *Controller) syncMachineConfigHyperShift(name string, labels map[string]string, profile *tunedv1.Profile) error {
+	var (
+		kernelArguments []string
+		ignFiles        []ign3types.File
+		ignUnits        []ign3types.Unit
+	)
+
+	if v := profile.ObjectMeta.Annotations[tunedv1.GeneratedByOperandVersionAnnotationKey]; v != os.Getenv("RELEASE_VERSION") {
+		// This looks like an update triggered by an old (not-yet-upgraded) operand.  Ignore it.
+		klog.Infof("refusing to sync MachineConfig %q due to Profile %q change generated by operand version %q", name, profile.Name, v)
+		return nil
+	}
+
+	bootcmdline := profile.Status.Bootcmdline
+	stalld := profile.Status.Stalld
+	logline := func(bIgn, bCmdline bool, bootcmdline string) string {
+		var (
+			sb strings.Builder
+		)
+
+		if bIgn {
+			sb.WriteString(" ignition")
+			if bCmdline {
+				sb.WriteString(" and")
+			}
+		}
+
+		if bCmdline {
+			sb.WriteString(" kernel parameters: [")
+			sb.WriteString(bootcmdline)
+			sb.WriteString("]")
+		}
+
+		return sb.String()
+	}
+	kernelArguments = util.SplitKernelArguments(bootcmdline)
+	ignFiles = tunedpkg.ProvideIgnitionFiles(stalld)
+	ignUnits = tunedpkg.ProvideSystemdUnits(stalld)
+
+	annotations := map[string]string{GeneratedByControllerVersionAnnotationKey: version.Version}
+
+	configMapName := mcConfigMapName(name)
+	mcConfigMap, err := c.clients.ManagementKube.CoreV1().ConfigMaps(ntoconfig.OperatorNamespace()).Get(context.TODO(), configMapName, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			klog.V(2).Infof("syncMachineConfigHyperShift(): configMap %s not found, creating one", configMapName)
+			haveIgnition := len(ignFiles) != 0 || len(ignUnits) != 0
+			if len(bootcmdline) == 0 && !haveIgnition {
+				// Creating a new MachineConfig with empty kernelArguments/Ignition only causes unnecessary node
+				// reboots.
+				klog.V(2).Infof("not creating a MachineConfig with empty kernelArguments/Ignition")
+				return nil
+			}
+			mc := newMachineConfig(name, annotations, labels, kernelArguments, ignFiles, ignUnits)
+			// PUT MC INTO ConfigMap and create that instead
+			mcConfigMap, err = newConfigMapForMachineConfig(configMapName, "TODOADDNODEPOOLNAME", mc)
+			if err != nil {
+				return fmt.Errorf("failed to generate ConfigMap %s for MachineConfig %s: %v", configMapName, mc.ObjectMeta.Name, err)
+			}
+			_, err = c.clients.ManagementKube.CoreV1().ConfigMaps(ntoconfig.OperatorNamespace()).Create(context.TODO(), mcConfigMap, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create ConfigMap %s for MachineConfig %s: %v", configMapName, mc.ObjectMeta.Name, err)
+			}
+			klog.Infof("created ConfigMap %s for MachineConfig %s with %s", mc.ObjectMeta.Name, logline(haveIgnition, len(bootcmdline) != 0, bootcmdline))
+			return nil
+		}
+		return err
+	}
+
+	// A MachineConfig with the same name was found
+	// we need to make sure the contents are  up-to-date.
+	mc, err := getMachineConfigFromConfigMap(mcConfigMap)
+	if err != nil {
+		return fmt.Errorf("failed to get MachineConfig from ConfigMap %s: %v", mcConfigMap.Name, err)
+	}
+
+	mcNew := newMachineConfig(name, annotations, labels, kernelArguments, ignFiles, ignUnits)
+
+	// Compare ign between existing and new mcfg
+	ignEq, err := ignEqual(mc, mcNew)
+	if err != nil {
+		return fmt.Errorf("failed to sync MachineConfig %s: %v", mc.ObjectMeta.Name, err)
+	}
+
+	// Compare kargs between existing and new mcfg
+	kernelArgsEq := util.StringSlicesEqual(mc.Spec.KernelArguments, kernelArguments)
+
+	// TODO add a check that Labels are equal
+
+	// If mcfgs are equivalent don't update
+	if kernelArgsEq && ignEq {
+		// No update needed
+		klog.V(2).Infof("syncMachineConfig(): MachineConfig %s doesn't need updating", mc.ObjectMeta.Name)
+		return nil
+	}
+
+	// If mcfgs are not equivalent do update
+	mc = mc.DeepCopy() // never update the objects from cache
+	mc.ObjectMeta.Annotations = mcNew.ObjectMeta.Annotations
+	mc.Spec.KernelArguments = kernelArguments
+	mc.Spec.Config = mcNew.Spec.Config
+
+	l := logline(!ignEq, !kernelArgsEq, bootcmdline)
+	klog.V(2).Infof("syncMachineConfig(): updating MachineConfig %s with%s", mc.ObjectMeta.Name, l)
+
+	// TODO in hypershift update the ConfigMap not the MachineConfig....
+	// Are ConfigMaps mutable? Or do we just delete and recreate?
+	newData, err := serializeMachineConfig(mc)
+	if err != nil {
+		return fmt.Errorf("failed to serialize configMap for MachineConfig %s: %v", mc.Name, err)
+	}
+	mcConfigMap.Data[mcConfigMapDataKey] = string(newData)
+
+	_, err = c.clients.ManagementKube.CoreV1().ConfigMaps(ntoconfig.OperatorNamespace()).Update(context.TODO(), mcConfigMap, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to update ConfigMap for MachineConfig %s: %v", mcConfigMap.Name, err)
+	}
+
+	klog.Infof("updated ConfigMap %s for MachineConfig %s with %s", mcConfigMap.Name, mc.ObjectMeta.Name, l)
 
 	return nil
 }
@@ -819,6 +967,48 @@ func (c *Controller) pruneMachineConfigs() error {
 	return nil
 }
 
+// pruneMachineConfigs removes any MachineConfigs created by the operator that are not selected by any of the Tuned daemon profile.
+func (c *Controller) pruneMachineConfigsHyperShift() error {
+	cmListOptions := metav1.ListOptions{
+		LabelSelector: mcConfigMapLabelKey + "=true",
+	}
+	cmList, err := c.clients.ManagementKube.CoreV1().ConfigMaps(ntoconfig.OperatorNamespace()).List(context.TODO(), cmListOptions)
+	if err != nil {
+		return err
+	}
+
+	mcNames, err := c.getConfigMapNamesForTuned()
+	if err != nil {
+		return err
+	}
+
+	for _, cm := range cmList.Items {
+		klog.Infof("pruneMachineConfigsHyperShift(): configMap: %s, mcNames[configMap]: %t", cm.Name, mcNames[cm.ObjectMeta.Name])
+		if cm.ObjectMeta.Annotations != nil {
+			if _, ok := cm.ObjectMeta.Annotations[GeneratedByControllerVersionAnnotationKey]; !ok {
+				continue
+			}
+			// mc's annotations have the controller/operator key
+
+			if mcNames[cm.ObjectMeta.Name] {
+				continue
+			}
+
+			// This ConfigMap has this operator's annotations and it is not currently used by any
+			// Tuned CR; remove it and let MCO roll-back any changes
+			klog.Infof("pruneMachineConfigsHyperShift(): deleting ConfigMap %s", cm.ObjectMeta.Name)
+			err = c.clients.ManagementKube.CoreV1().ConfigMaps(ntoconfig.OperatorNamespace()).Delete(context.TODO(), cm.ObjectMeta.Name, metav1.DeleteOptions{})
+			if err != nil {
+				// Unable to delete the ConfigMap
+				return err
+			}
+			klog.Infof("deleted MachineConfig ConfigMap %s", cm.ObjectMeta.Name)
+		}
+	}
+
+	return nil
+}
+
 // Get all operator MachineConfig names for all Tuned daemon profiles.
 func (c *Controller) getMachineConfigNamesForTuned() (map[string]bool, error) {
 	tunedList, err := c.listers.TunedResources.List(labels.Everything())
@@ -843,6 +1033,38 @@ func (c *Controller) getMachineConfigNamesForTuned() (map[string]bool, error) {
 	}
 
 	return mcNames, nil
+}
+
+// Get all operator ConfigMap names for all Tuned daemon profiles.
+func (c *Controller) getConfigMapNamesForTuned() (map[string]bool, error) {
+	tunedList, err := c.listers.TunedResources.List(labels.Everything())
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Tuned: %v", err)
+	}
+
+	cmNames := map[string]bool{}
+
+	for _, recommend := range tunedRecommend(tunedList) {
+		isNodePoolMatchingUsed := recommend.MachineConfigLabels[nodePoolAnnotationKey] != ""
+		if recommend.Profile == nil || recommend.Match != nil || !isNodePoolMatchingUsed {
+			continue
+		}
+
+		//TODO Take into account fully defined nodePool names: namespace/name
+		var nodePoolName string
+		nodePoolNameSplit := strings.Split(recommend.MachineConfigLabels[nodePoolAnnotationKey], "/")
+		if len(nodePoolNameSplit) > 1 {
+			nodePoolName = nodePoolNameSplit[1]
+		} else {
+			nodePoolName = nodePoolNameSplit[0]
+		}
+		cmName := mcConfigMapName(nodePoolName)
+
+		klog.Infof("TODO remove this log. getConfigMapNamesForTuned, adding mcConfigMapName to list of needed names: %s", cmName)
+		cmNames[cmName] = true
+	}
+
+	return cmNames, nil
 }
 
 func getDefaultTunedRefs(tuned *tunedv1.Tuned) []metav1.OwnerReference {
@@ -1072,6 +1294,9 @@ func (c *Controller) run(ctx context.Context) {
 
 	var configMapInformerFactory kubeinformers.SharedInformerFactory
 	var mcfgInformerFactory mcfginformers.SharedInformerFactory
+
+	// TODO switch to ConfigMap informers with certain labels
+	// TODO how can we distinguish between ConfigMaps with different contents (maybe by labels?)
 	if ntoconfig.InHyperShift() {
 		labelOptions := kubeinformers.WithTweakListOptions(func(opts *metav1.ListOptions) {
 			opts.LabelSelector = tunedConfigMapAnnotation + "=true"
@@ -1132,6 +1357,11 @@ func (c *Controller) NeedLeaderElection() bool {
 	return true
 }
 
+// Take into account fully defined nodePool names: namespace/name
+func mcConfigMapName(name string) string {
+	return HyperShiftConfigMapPrefix + name
+}
+
 func tunedMapFromList(tuneds []tunedv1.Tuned) map[string]tunedv1.Tuned {
 	ret := map[string]tunedv1.Tuned{}
 	for _, tuned := range tuneds {
@@ -1139,4 +1369,3 @@ func tunedMapFromList(tuneds []tunedv1.Tuned) map[string]tunedv1.Tuned {
 	}
 	return ret
 }
-

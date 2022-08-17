@@ -55,6 +55,7 @@ func newMachineConfig(name string, annotations map[string]string, labels map[str
 	return &mcfgv1.MachineConfig{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: mcfgv1.SchemeGroupVersion.String(),
+			Kind:       "MachineConfig",
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
@@ -259,4 +260,22 @@ func (pc *ProfileCalculator) getPrimaryPoolForNode(node *corev1.Node) (*mcfgv1.M
 		return nil, nil
 	}
 	return pools[0], nil
+}
+
+func (pc *ProfileCalculator) getNodePoolNameForNode(node *corev1.Node) (string, error) {
+	ownerNameLabel := "cluster.x-k8s.io/owner-name"
+	ownerKindLabel := "cluster.x-k8s.io/owner-kind"
+
+	var nodeMachineSet string
+
+	if node.Annotations[ownerKindLabel] == "MachineSet" {
+		nodeMachineSet = node.Annotations[ownerNameLabel]
+	}
+	machineSetNameSplit := strings.Split(nodeMachineSet, "-")
+	if (len(machineSetNameSplit)) < 2 {
+		return "", fmt.Errorf("Cannot determine NodePool Name for Node: %s, MachineSet: %s", node.Name, nodeMachineSet)
+	}
+	nodePoolName := strings.Join(machineSetNameSplit[:(len(machineSetNameSplit)-1)], "-")
+	klog.Infof("Calculated nodePoolName: %s for node %s with nodeMachineSet value: %s", nodePoolName, node.Name, nodeMachineSet)
+	return nodePoolName, nil
 }

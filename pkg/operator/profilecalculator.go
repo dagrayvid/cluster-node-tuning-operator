@@ -187,11 +187,8 @@ func (pc *ProfileCalculator) calculateProfile(nodeName string) (string, map[stri
 				return "", nil, nil, operand, err
 			}
 
-			if config.InHyperShift() {
-				pools, err = pc.getPoolsForNode(node)
-			} else {
-				pools, err = nil, nil
-			}
+			// TODO if in hypershift get NodePool for Node
+			pools, err = pc.getPoolsForNode(node)
 
 			if err != nil {
 				return "", nil, nil, operand, err
@@ -212,6 +209,78 @@ func (pc *ProfileCalculator) calculateProfile(nodeName string) (string, map[stri
 	}
 
 	return defaultProfile, nil, nil, operand, fmt.Errorf("the default Tuned CR misses a catch-all profile selection")
+}
+
+// calculateProfile calculates a tuned profile for Node nodeName.
+//
+// Returns
+// * the tuned daemon profile name
+// * MachineConfig labels if the profile was selected by machineConfigLabels
+// * MachineConfigPools for 'nodeName' if the profile was selected by machineConfigLabels
+// * whether to run the Tuned daemon in debug mode on node nodeName
+// * an error if any
+func (pc *ProfileCalculator) calculateProfileHyperShift(nodeName string) (string, string, tunedv1.OperandConfig, error) {
+	var operand tunedv1.OperandConfig
+
+	klog.V(3).Infof("calculateProfile(%s)", nodeName)
+	tunedList, err := pc.listers.TunedResources.List(labels.Everything())
+	if err != nil {
+		return "", "", operand, fmt.Errorf("failed to list Tuned: %v", err)
+	}
+
+	for _, recommend := range tunedRecommend(tunedList) {
+		var (
+			nodePoolName string
+			node         *corev1.Node
+		)
+
+		if node == nil {
+			// We did not retrieve the node object from cache yet -- get it and also the pools
+			// for this node.  Do not move this code outside the for loop, fetching the node/pools
+			// is often unneeded and would likely have a performance impact.
+			node, err = pc.listers.Nodes.Get(nodeName)
+			if err != nil {
+				return "", "", operand, err
+			}
+
+			// TODO if in hypershift get NodePool for Node
+			nodePoolName, err = pc.getNodePoolNameForNode(node)
+			if err != nil {
+				return "", nodePoolName, operand, err
+			}
+		}
+
+		profileSourceNodePool := recommend.MachineConfigLabels[nodePoolAnnotationKey]
+		// TODO Remove this strings.Contains call. We should use exact string matching,
+		// but we need to update getNodePoolNameForNode to get the fully defined namespace/name nodePool name via the cluster api.
+		// If nil in the case of the default openshift-node profile
+		if profileSourceNodePool != "" && !strings.Contains(profileSourceNodePool, nodePoolName) {
+			continue
+		}
+
+		// If recommend.Match is used and the profileMatches, use this profile
+		if recommend.Match != nil && pc.profileMatches(recommend.Match, nodeName) {
+			klog.Infof("calculateProfileHyperShift: node label matching used node: %s, tunedProfileName: %s, nodePoolName: %s, err: %v", nodeName, *recommend.Profile, "", recommend.Operand, nil)
+			return *recommend.Profile, "", recommend.Operand, nil
+		}
+
+		// Only create MachineConfigs if recommend.Match is nil.
+		// In this case NodePool based matching is assumed.
+		if recommend.Match == nil {
+			klog.Infof("calculateProfileHyperShift: MachineConfigs enabled: node: %s, tunedProfileName:  %s, nodePoolName: %s, err: %v", nodeName, *recommend.Profile, nodePoolName, recommend.Operand, nil)
+			return *recommend.Profile, nodePoolName, recommend.Operand, nil
+		}
+	}
+
+	// This should never happen; the default Tuned CR should always be accessible and with a catch-all rule
+	// in the "recommend" section to select the default profile for the tuned daemon.
+	_, err = pc.listers.TunedResources.Get(tunedv1.TunedDefaultResourceName)
+	if err != nil {
+		return defaultProfile, "", operand, fmt.Errorf("failed to get Tuned %s: %v", tunedv1.TunedDefaultResourceName, err)
+	}
+
+	klog.Infof("calculateProfileHyperShift: default profile set: node: %s tunedProfileName: %s, nodePoolName: %s, operand: %s, err: %v", nodeName, defaultProfile, "", fmt.Errorf("the default Tuned CR misses a catch-all profile selection"))
+	return defaultProfile, "", operand, fmt.Errorf("the default Tuned CR misses a catch-all profile selection")
 }
 
 // profileMatches returns true, if Node 'nodeName' fulfills all the necessary
@@ -479,9 +548,32 @@ func tunedRecommend(tunedSlice []*tunedv1.Tuned) []tunedv1.TunedRecommend {
 		return tunedSlice[i].Name < tunedSlice[j].Name
 	})
 
-	for _, tuned := range tunedSlice {
-		if tuned.Spec.Recommend != nil {
-			recommendAll = append(recommendAll, tuned.Spec.Recommend...)
+	if config.InHyperShift() {
+		// In HyperShift, we need to know which NodePool each TunedRecommend is coming from
+		// to map the MachineConfig to a Node. We can represent this internally (only!) by
+		// adding the nodePool to the MachineConfigLabels for the TunedRecommends returned
+		// by this function
+		for _, tuned := range tunedSlice {
+			if tuned.Spec.Recommend != nil {
+				for i, rec := range tuned.Spec.Recommend {
+					if rec.MachineConfigLabels == nil {
+						rec.MachineConfigLabels = make(map[string]string)
+					}
+					rec.MachineConfigLabels[nodePoolAnnotationKey] = tuned.Annotations[nodePoolAnnotationKey]
+					tuned.Spec.Recommend[i] = rec
+					klog.Infof("setting tunedRecommend for profile: %s, MachineConfigLabel[nodepool]: %s", *rec.Profile, tuned.Annotations[nodePoolAnnotationKey])
+				}
+				recommendAll = append(recommendAll, tuned.Spec.Recommend...)
+				for _, rec := range tuned.Spec.Recommend {
+					klog.Infof("tunedRecommend for profile: %s, MachineConfigLabel[nodepoool]: %s", *rec.Profile, rec.MachineConfigLabels[nodePoolAnnotationKey])
+				}
+			}
+		}
+	} else {
+		for _, tuned := range tunedSlice {
+			if tuned.Spec.Recommend != nil {
+				recommendAll = append(recommendAll, tuned.Spec.Recommend...)
+			}
 		}
 	}
 
