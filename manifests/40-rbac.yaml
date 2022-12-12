@@ -89,7 +89,11 @@ rules:
   verbs: ["*"]
 - apiGroups: ["operators.coreos.com"]
   resources: ["clusterserviceversions","operatorgroups","subscriptions"]
-  verbs: ["get","delete","list","update","watch"] 
+  verbs: ["get","delete","list","update","watch"]
+# Needed by the kube-rbac-proxy, to authenticate connections to the metrics endpoint.
+- apiGroups: ["authentication.k8s.io"]
+  resources:["tokenreviews"]
+  verbs: ["create"]
 ---
 
 # Bind the operator cluster role to its Service Account.

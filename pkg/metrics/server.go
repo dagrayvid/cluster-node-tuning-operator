@@ -39,7 +39,7 @@ func buildServer(port int) *http.Server {
 		},
 	)
 
-	bindAddr := fmt.Sprintf(":%d", port)
+	bindAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	router := http.NewServeMux()
 	router.Handle("/metrics", handler)
 	srv := &http.Server{

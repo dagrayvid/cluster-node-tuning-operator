@@ -24,9 +24,10 @@ metadata:
   name: node-tuning-operator
   namespace: openshift-cluster-node-tuning-operator
 spec:
-  clusterIP: None
+  type: ClusterIP
   ports:
-  - port: 60000
+  - name: https
+    port: 9393
     protocol: TCP
     targetPort: 60000
   selector:
@@ -82,7 +83,8 @@ metadata:
   namespace: openshift-cluster-node-tuning-operator
 spec:
   endpoints:
-  - targetPort: 60000
+  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    port: https
     interval: 60s
     scheme: https
     path: /metrics
@@ -91,6 +93,10 @@ spec:
       serverName: node-tuning-operator.openshift-cluster-node-tuning-operator.svc
       certFile: /etc/prometheus/secrets/metrics-client-certs/tls.crt
       keyFile: /etc/prometheus/secrets/metrics-client-certs/tls.key
+  jobLabel: component
+  namespaceSelector:
+    matchNames:
+    - openshift-cluster-node-tuning-operator
   selector:
     matchLabels:
       name: node-tuning-operator
